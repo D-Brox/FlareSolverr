@@ -4,9 +4,9 @@ import platform
 import sys
 import time
 from datetime import timedelta
-from html import escape
+from html import escape, unescape
 from random import uniform
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlsplit
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -268,7 +268,7 @@ def click_verify(driver: WebDriver, num_tabs: int = 1):
             actions.send_keys(Keys.TAB).pause(0.1 + uniform(0.02, 0.1))
         actions.pause(1 + uniform(0.1, 0.5))
         actions.send_keys(Keys.SPACE).perform()
-        
+
         logging.debug(f"Cloudflare verify checkbox clicked after {num_tabs} tabs!")
     except Exception:
         logging.debug("Cloudflare verify checkbox not found on the page.")
@@ -302,7 +302,7 @@ def _get_turnstile_token(driver: WebDriver, tabs: int):
             if turnstile_token != current_value:
                 logging.info(f"Turnstile token: {turnstile_token}")
                 return turnstile_token
-        logging.debug(f"Failed to extract token possibly click failed")        
+        logging.debug(f"Failed to extract token possibly click failed")
 
         # reset focus
         driver.execute_script("""
@@ -329,7 +329,7 @@ def _resolve_turnstile_captcha(req: V1RequestBase, driver: WebDriver):
 
         turnstile_challenge_found = False
         for selector in TURNSTILE_SELECTORS:
-            found_elements = driver.find_elements(By.CSS_SELECTOR, selector)   
+            found_elements = driver.find_elements(By.CSS_SELECTOR, selector)
             if len(found_elements) > 0:
                 turnstile_challenge_found = True
                 logging.info("Turnstile challenge detected. Selector found: " + selector)
@@ -484,7 +484,9 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             logging.info("Waiting " + str(req.waitInSeconds) + " seconds before returning the response...")
             time.sleep(req.waitInSeconds)
 
-        challenge_res.response = driver.page_source
+        # a JSON POST keeps the pristine response body: document.write() would wrap
+        # it in <html><head></head><body>...</body></html>
+        challenge_res.response = _unwrap_json_response(driver.page_source)
 
     if req.returnScreenshot:
         challenge_res.screenshot = driver.get_screenshot_as_base64()
@@ -494,6 +496,29 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
 
     res.result = challenge_res
     return res
+
+
+_JSON_RESPONSE_WRAPPER = re.compile(
+    r'\A\s*<html\s*>\s*<head\s*>\s*</head\s*>\s*<body\s*>(?P<body>.*)</body\s*>\s*</html\s*>\s*\Z',
+    re.DOTALL | re.IGNORECASE)
+
+
+def _unwrap_json_response(html_response: str) -> str:
+    """Return the JSON body of an empty document shell wrapping it.
+
+    document.write() parses the POST response as HTML, so a JSON body comes back
+    from page_source nested in <html><head></head><body>...</body></html>. Real
+    HTML pages have content in <head>, so they don't match and pass through.
+    """
+    match = _JSON_RESPONSE_WRAPPER.match(html_response)
+    if match is None:
+        return html_response
+    body = unescape(match.group('body')).strip()
+    try:
+        json.loads(body)
+    except ValueError:
+        return html_response  # not JSON, leave the response alone
+    return body
 
 
 def _post_request(req: V1RequestBase, driver: WebDriver):
@@ -542,18 +567,54 @@ def _post_request(req: V1RequestBase, driver: WebDriver):
     driver.get("data:text/html;charset=utf-8,{html_content}".format(html_content=html_content))
 
 
+def _origin_url(url: str) -> str:
+    """Return the origin of url (scheme://host[:port]/) to use as fetch() context.
+
+    Navigating to the API endpoint itself is unreliable: a GET on a POST-only
+    endpoint replies 405, and an endpoint answering with a non-HTML
+    Content-Type (application/json) or Content-Disposition makes Chrome
+    download it, leaving no document at that origin to run fetch() from.
+    The origin root always serves an HTML document.
+    """
+    parts = urlsplit(url if '://' in url else 'http://' + url)
+    host = parts.netloc.rsplit('@', 1)[-1]  # drop any userinfo
+    if not parts.scheme or not host or any(c.isspace() for c in host):
+        logging.debug("Could not extract an origin from %s, using it as-is", url)
+        return url
+    return "%s://%s/" % (parts.scheme, parts.netloc)
+
+
 def _json_post_request(req: V1RequestBase, driver: WebDriver, post_data: str):
     """Send a JSON POST using fetch() so numeric/boolean types are preserved.
 
-    Navigates to the target URL first (GET) to establish a same-origin context,
-    which allows the subsequent fetch() to bypass CORS restrictions.
-    The fetch response overwrites the page so driver.page_source contains it.
+    Navigates to the origin of the target URL first (GET) to establish a
+    same-origin context, which allows the subsequent fetch() to bypass CORS
+    restrictions. The fetch response overwrites the page so driver.page_source
+    contains it.
     """
     logging.debug("JSON postData detected, using fetch() with Content-Type: application/json")
-    driver.get(req.url)
+    logging.debug("JSON POST body (%d bytes): %s", len(post_data), post_data)
+
+    origin = _origin_url(req.url)
+    logging.debug("JSON GET %s first, to get a same-origin context for the POST to %s", origin, req.url)
+    driver.get(origin)
+
+    try:
+        landed = driver.execute_script("return location.origin")
+        expected = origin.rstrip('/')
+        if landed != expected:
+            logging.warning("  the GET to %s landed on origin %s, not %s. The POST will be "
+                            "cross-origin and CORS will block it.", origin, landed, expected)
+    except Exception as e:
+        logging.debug("  could not read location.origin: %s", e)
 
     script = """
         var callback = arguments[arguments.length - 1];
+        var ctx = {
+            pageUrl: location.href,
+            origin: location.origin,
+            readyState: document.readyState
+        };
         fetch(arguments[0], {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -563,12 +624,80 @@ def _json_post_request(req: V1RequestBase, driver: WebDriver, post_data: str):
                 document.open();
                 document.write(text);
                 document.close();
-                callback('ok');
+                callback({
+                    ok: true,
+                    status: response.status,
+                    statusText: response.statusText,
+                    responseUrl: response.url,
+                    pageUrl: ctx.pageUrl,
+                    origin: ctx.origin,
+                    readyState: ctx.readyState
+                });
             });
         }).catch(function(e) {
-            callback('error: ' + e.message);
+            callback({
+                ok: false,
+                name: e.name,
+                message: e.message,
+                stack: e.stack,
+                pageUrl: ctx.pageUrl,
+                origin: ctx.origin,
+                readyState: ctx.readyState
+            });
         });
     """
     result = driver.execute_async_script(script, req.url, post_data)
-    if result and result.startswith('error:'):
-        logging.warning("JSON POST fetch() failed: %s", result)
+    if isinstance(result, dict) and not result.get('ok'):
+        _log_json_post_failure(req, driver, post_data, result)
+
+
+def _log_json_post_failure(req: V1RequestBase, driver: WebDriver, post_data: str, err: dict):
+    """Log why fetch() reported a generic "Failed to fetch".
+
+    fetch() rejects with the same opaque TypeError for every network-layer
+    problem (CORS, CSP, mixed content, TLS, DNS, refused connection...), so the
+    JS error alone is useless. Chrome logs the actual cause in the console,
+    which is collected through the driver's 'browser' log.
+    """
+    logging.warning("JSON POST fetch() failed: %s: %s", err.get('name'), err.get('message'))
+    logging.warning("  request url: %s", req.url)
+    logging.warning("  page after GET: %s (origin=%s, readyState=%s)",
+                    err.get('pageUrl'), err.get('origin'), err.get('readyState'))
+    if err.get('stack'):
+        logging.debug("  fetch stack: %s", err['stack'])
+
+    # a redirect on the GET (http -> https, login bounce, api -> www, apex -> www)
+    # moves the page to another origin, so the POST becomes cross-origin and CORS kills it
+    try:
+        page_origin = err.get('origin')
+        target_origin = _origin_url(req.url).rstrip('/')
+        if page_origin and target_origin and page_origin != target_origin:
+            logging.warning("  ORIGIN MISMATCH: the GET landed on %s but the POST goes to %s. "
+                            "The fetch is cross-origin and will be blocked unless the response "
+                            "has Access-Control-Allow-Origin.", page_origin, target_origin)
+    except Exception as e:
+        logging.debug("  could not compare origins: %s", e)
+
+    # the console holds the real reason, e.g.
+    # "blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present...",
+    # "violates the following Content Security Policy directive: connect-src ...",
+    # "net::ERR_CONNECTION_REFUSED", "net::ERR_NAME_NOT_RESOLVED", "Mixed Content"
+    try:
+        console = driver.get_log('browser') or []
+    except Exception as e:
+        console = []
+        logging.debug("  browser console log unavailable (is goog:loggingPrefs set?): %s", e)
+
+    noisy = ('favicon', 'devtools', 'download the react', 'source map')
+    for entry in console:
+        try:
+            text = entry.get('message', '')
+            level = entry.get('level', '')
+            origin = entry.get('source', '')
+            if not any(n in text.lower() for n in noisy):
+                logging.warning("  [console:%s/%s] %s", level, origin, text)
+        except Exception:
+            pass
+
+    logging.warning("  POST was NOT sent successfully; page_source will not contain "
+                    "the API response. Run with LOG_LEVEL=debug for the body and stack.")

@@ -206,6 +206,13 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
 
     options.add_argument('--disable-features=%s' % ','.join(disabled_features))
 
+    # Collect the browser console in the driver session.
+    # fetch() swallows the real reason of a failure ("Failed to fetch"), but Chrome
+    # always logs the actual cause (CORS, CSP connect-src, net::ERR_*, etc) here.
+    # Only 'browser' is enabled on purpose: undetected_chromedriver's Reactor drains
+    # the 'performance' log, and FlareSolverr doesn't start it (enable_cdp_events=False).
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
+
     # note: headless mode is detected (headless = True)
     # we launch the browser in head-full mode with the window hidden
     windows_headless = False
