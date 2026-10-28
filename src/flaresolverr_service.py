@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import platform
+import re
 import sys
 import time
 from datetime import timedelta
@@ -54,6 +56,16 @@ CHALLENGE_SELECTORS = [
 TURNSTILE_SELECTORS = [
     "input[name='cf-turnstile-response']"
 ]
+
+# comix.to's own WAF grants this after its /@waf/verify endpoint accepts a
+# Turnstile token from the widget at /@waf/challenge
+WAF_PASS_COOKIE = 'waf_pass'
+
+# Pass cookies closer to expiry than this are silently re-solved instead of
+# being handed out, so a pinned session never returns cookies that will die
+# mid-request. 0 disables the regen check (fresh = not expired at all).
+TURNSTILE_REGEN_WINDOW_SECONDS = int(
+    os.environ.get('TURNSTILE_REGEN_WINDOW_SECONDS', '300'))
 
 SESSIONS_STORAGE = SessionsStorage()
 
@@ -340,6 +352,229 @@ def _resolve_turnstile_captcha(req: V1RequestBase, driver: WebDriver):
             logging.debug(f'Turnstile challenge not found')
     return turnstile_token
 
+def _turnstile_token_value(driver: WebDriver):
+    try:
+        return driver.execute_script(
+            "var el = document.querySelector(\"input[name='cf-turnstile-response']\");"
+            "return el ? (el.value || '') : '';") or ''
+    except Exception:
+        return ''
+
+
+def _click_turnstile_widget(driver: WebDriver):
+    """Real mouse click on the Turnstile checkbox inside its iframe."""
+    try:
+        driver.switch_to.default_content()
+        iframes = driver.find_elements(
+            By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
+        if not iframes:
+            return False
+        box = iframes[0]
+        height = box.size.get('height', 65) if box.size else 65
+        actions = ActionChains(driver)
+        actions.move_to_element_with_offset(box, 30, max(height // 2, 5))
+        actions.click()
+        actions.perform()
+        logging.debug("Clicked inside the Turnstile iframe")
+        return True
+    except Exception as e:
+        logging.debug(f"Turnstile iframe click failed: {e}")
+        return False
+    finally:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+
+def _turnstile_widget_present(driver: WebDriver):
+    try:
+        return bool(driver.execute_script(
+            "return !!document.querySelector(\"input[name='cf-turnstile-response']\");"))
+    except Exception:
+        return False
+
+
+def _has_pass_cookie(driver: WebDriver):
+    try:
+        return any(c.get('name') == WAF_PASS_COOKIE for c in driver.get_cookies())
+    except Exception:
+        return False
+
+
+def _pass_cookie(driver: WebDriver, name: str):
+    """(expiry_epoch, value) of a cookie in this driver's jar, or (None, None)."""
+    try:
+        for c in driver.get_cookies():
+            if c.get('name') == name:
+                return c.get('expiry'), c.get('value')
+    except Exception:
+        pass
+    return None, None
+
+
+def _waf_jar_state(driver: WebDriver, url: str):
+    """How the target site's pass cookies are doing in this driver's jar.
+
+    'fresh' - every required pass cookie present and outside the regen window
+    'stale' - present but inside the regen window
+    'cold'  - a required cookie is missing; also the answer when this driver is
+              not sitting on the target host, since Selenium only exposes
+              cookies for the current domain and we cannot inspect the jar
+    Returns (state, seconds_to_expiry of the governing cookie).
+    """
+    try:
+        target_host = (urlsplit(url).hostname or '').removeprefix('www.')
+    except Exception:
+        return 'cold', None
+    try:
+        current_host = (urlsplit(driver.current_url or '').hostname or '').removeprefix('www.')
+    except Exception:
+        current_host = ''
+    if not target_host or current_host != target_host:
+        return 'cold', None
+
+    required = ['cf_clearance']
+    if 'comix.to' in target_host:
+        required.append(WAF_PASS_COOKIE)
+    governing = None
+    for name in required:
+        expiry, _ = _pass_cookie(driver, name)
+        if expiry is None:
+            return 'cold', None
+        remaining = expiry - time.time()
+        if governing is None or remaining < governing:
+            governing = remaining
+    return ('fresh' if governing > TURNSTILE_REGEN_WINDOW_SECONDS else 'stale'), governing
+
+
+def _snap_state(driver: WebDriver, start_url: str, before_names=frozenset()):
+    """(token, verify_trail_signal, url_changed) for any site's own verify flow."""
+    token = _turnstile_token_value(driver)
+    new_cookie = False
+    try:
+        for c in driver.get_cookies():
+            if c.get('name') not in before_names:
+                new_cookie = True
+                break
+    except Exception:
+        pass
+    try:
+        url_changed = start_url is not None and driver.current_url != start_url
+    except Exception:
+        url_changed = False
+    return token, new_cookie, url_changed
+
+
+def _solve_site_turnstile(driver: WebDriver, deadline: float, force: bool = False):
+    """Solve a page-embedded Turnstile widget.
+
+    comix.to's own WAF (/@waf/challenge) is special-cased: its verify only
+    counts once the granted `waf_pass` cookie is actually in the jar - an
+    unverified jar makes every subsequent API call 403 - so we hold until it
+    lands. Any other site gets the fast generic treatment (token, redirect or
+    new cookie, then a short trail).
+
+    `force` (set when the jar holds an about-to-expire pass) bypasses the
+    short-circuits that would otherwise accept the existing pass and keeps
+    clicking until the verify mints a renewed one.
+    """
+    try:
+        current_url = driver.current_url
+    except Exception:
+        current_url = ''
+    comix_waf = 'comix.to' in current_url and '/@waf/challenge' in current_url
+
+    if _turnstile_token_value(driver) and not force:
+        logging.debug("Turnstile widget already carries a token")
+        return True
+    # the widget may not be rendered yet (a Cloudflare JS-only interstitial can
+    # still be clearing); for the comix WAF that must not matter - the point is
+    # to hold until waf_pass lands, and clicks are harmless meanwhile
+    if not comix_waf and not _turnstile_widget_present(driver):
+        logging.debug("No Turnstile widget on this page")
+        return False
+    try:
+        before_names = frozenset(c.get('name') for c in driver.get_cookies())
+    except Exception:
+        before_names = frozenset()
+    logging.info(f"Embedded Turnstile widget detected ({'comix waf' if comix_waf else 'generic'}); attempting to solve it")
+
+    if comix_waf:
+        # the verify POST that grants waf_pass is followed by a redirect away
+        # from the challenge page - so the redirect IS the success signal, and
+        # the pass cookie is guaranteed to be in the jar by then. A Cloudflare
+        # interstitial may sit in front; the clicks move that along too.
+        old_expiry, old_value = _pass_cookie(driver, WAF_PASS_COOKIE)
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
+            _click_turnstile_widget(driver)
+            click_verify(driver, num_tabs=1)
+            # poll fast: token -> verify -> Set-Cookie -> redirect all in ~2s
+            for _ in range(5):
+                time.sleep(0.8)
+                try:
+                    if '/@waf/challenge' not in (driver.current_url or ''):
+                        logging.info(f"Comix WAF passed after {attempts} click attempts "
+                                     f"(redirected to {driver.current_url})")
+                        return True
+                except Exception:
+                    pass
+                expiry, value = _pass_cookie(driver, WAF_PASS_COOKIE)
+                if value is not None and (not force or (value != old_value or expiry != old_expiry)):
+                    logging.info(f"Comix WAF passed after {attempts} click attempts "
+                                 f"({'renewed pass' if force else 'waf_pass set'})")
+                    return True
+            logging.debug(f"Comix WAF not passed yet (attempt {attempts})")
+        logging.warning("Comix WAF did not pass before the deadline")
+        return False
+
+    try:
+        start_url = driver.current_url
+    except Exception:
+        start_url = None
+
+    def generic_done():
+        token, new_cookie, url_changed = _snap_state(driver, start_url, before_names)
+        return bool(token) or new_cookie or url_changed
+
+    # non-interactive widgets: give the token a couple of seconds to appear
+    for _ in range(2):
+        time.sleep(1)
+        if generic_done():
+            return _trail_verify(driver, deadline, before_names)
+    attempts = 0
+    while time.monotonic() < deadline:
+        attempts += 1
+        _click_turnstile_widget(driver)
+        click_verify(driver, num_tabs=1)
+        # poll fast: tokens are issued within a second of a successful click
+        for _ in range(4):
+            time.sleep(0.75)
+            if generic_done():
+                logging.info(f"Turnstile widget solved after {attempts} attempts (token: {bool(_turnstile_token_value(driver))})")
+                return _trail_verify(driver, deadline, before_names)
+        logging.debug(f"Turnstile widget not solved yet (attempt {attempts})")
+    logging.debug("Turnstile widget did not resolve before the deadline")
+    return False
+
+
+def _trail_verify(driver: WebDriver, deadline: float, before_names=frozenset()):
+    """Generic sites: give the page a moment to finish its own verify POST and
+    let the granted cookie land, returning as soon as anything confirms it."""
+    for _ in range(6):
+        time.sleep(1)
+        if _has_pass_cookie(driver):
+            return True
+        _, new_cookie, url_changed = _snap_state(driver, None, before_names)
+        if new_cookie or url_changed:
+            return True
+        if time.monotonic() > deadline:
+            break
+    return _has_pass_cookie(driver)
+
+
 def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> ChallengeResolutionT:
     res = ChallengeResolutionT({})
     res.status = STATUS_OK
@@ -379,7 +614,30 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
         _post_request(req, driver)
     else:
         if req.tabs_till_verify is None:
+            jar_state, jar_expiry_in = 'cold', None
+            if os.environ.get('TURNSTILE_AUTO_SOLVE', 'true').lower() == 'true':
+                try:
+                    jar_state, jar_expiry_in = _waf_jar_state(driver, req.url)
+                except Exception as e:
+                    logging.debug(f"WAF jar check failed: {e}")
             driver.get(req.url)
+            # Pages can embed their own Turnstile widget (e.g. comix.to
+            # /@waf/challenge) and may have a callback.
+            if os.environ.get('TURNSTILE_AUTO_SOLVE', 'true').lower() == 'true':
+                if jar_state == 'fresh':
+                    logging.info(f"Warm jar: pass cookies still valid "
+                                 f"(expires in {int(jar_expiry_in or 0)}s); skipping Turnstile solve")
+                else:
+                    try:
+                        budget = min(60.0, max(10.0, int(req.maxTimeout) / 1000 - 15.0))
+                        turnstile_deadline = time.monotonic() + budget
+                        if jar_state == 'stale':
+                            logging.info(f"Stale pass cookie (expires in {int(jar_expiry_in or 0)}s); "
+                                         "forcing a renewed solve")
+                        _solve_site_turnstile(
+                            driver, turnstile_deadline, force=jar_state == 'stale')
+                    except Exception as e:
+                        logging.debug(f"Turnstile auto-solve skipped: {e}")
         else:
             turnstile_token = _resolve_turnstile_captcha(req, driver)
 
